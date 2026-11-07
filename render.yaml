@@ -2,12 +2,12 @@ databases:
   - name: coinrush-db
     databaseName: coinrush
     user: coinrush
-    plan: basic-256mb
+    plan: free
 services:
   - type: web
     name: coinrush
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health
