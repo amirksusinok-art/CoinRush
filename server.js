@@ -28,6 +28,8 @@ async function auth(req,res,next) { try { const parts=req.cookies.cr_session?.sp
 const requireUser=(req,res,next)=>req.user?next():next(fail('Войдите в аккаунт',401));
 const requireAdmin=(req,res,next)=>req.user?.role==='admin'?next():next(fail('Нет доступа',403));
 async function tx(fn) { const c=await pool.connect(); try {await c.query('BEGIN'); const value=await fn(c); await c.query('COMMIT'); return value;} catch(e){await c.query('ROLLBACK');throw e;} finally {c.release();} }
+async function snapshotPortfolio(c,userId){await c.query(`INSERT INTO portfolio_history(user_id,total) SELECT u.id,u.cash+COALESCE(sum(h.amount*coins.pool_cash/coins.pool_tokens),0) FROM users u LEFT JOIN holdings h ON h.user_id=u.id LEFT JOIN coins ON coins.id=h.coin_id WHERE u.id=$1 AND NOT EXISTS(SELECT 1 FROM portfolio_history p WHERE p.user_id=$1 AND p.created_at>now()-interval '5 minutes') GROUP BY u.id`,[userId]);}
+async function triggerAlerts(c,coinId,price){await c.query("UPDATE price_alerts SET triggered_at=now() WHERE coin_id=$1 AND triggered_at IS NULL AND ((direction='up' AND target<=$2) OR (direction='down' AND target>=$2))",[coinId,price]);}
 async function init(){
  await pool.query(`CREATE TABLE IF NOT EXISTS users(id uuid PRIMARY KEY,nickname text UNIQUE NOT NULL,email text UNIQUE NOT NULL,password_hash text NOT NULL,cash numeric(24,8) NOT NULL DEFAULT 1000,role text NOT NULL DEFAULT 'user',banned boolean NOT NULL DEFAULT false,created_at timestamptz DEFAULT now());
  CREATE TABLE IF NOT EXISTS coins(id uuid PRIMARY KEY,ticker text UNIQUE NOT NULL,name text NOT NULL,description text NOT NULL DEFAULT '',logo text NOT NULL DEFAULT '',creator_id uuid REFERENCES users(id),supply numeric(24,8) NOT NULL,pool_cash numeric(24,8) NOT NULL,pool_tokens numeric(24,8) NOT NULL,initial_price numeric(24,8) NOT NULL,created_at timestamptz DEFAULT now());
@@ -46,8 +48,11 @@ async function init(){
  await pool.query('ALTER TABLE coins ADD COLUMN IF NOT EXISTS region text');
  await pool.query('ALTER TABLE coins ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true');
  await pool.query('ALTER TABLE trades ADD COLUMN IF NOT EXISTS request_key uuid');
+ await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS initial_cash numeric(24,8) NOT NULL DEFAULT 1000');
+ await pool.query('ALTER TABLE holdings ADD COLUMN IF NOT EXISTS cost_basis numeric(24,8)');
  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS trades_request_key ON trades(user_id,request_key) WHERE request_key IS NOT NULL');
  await pool.query(`CREATE TABLE IF NOT EXISTS bot_trades(id uuid PRIMARY KEY,bot_id uuid REFERENCES bot_accounts(id),coin_id uuid REFERENCES coins(id),side text NOT NULL,amount numeric(24,8) NOT NULL,cash numeric(24,8) NOT NULL,price numeric(24,8) NOT NULL,created_at timestamptz DEFAULT now());CREATE INDEX IF NOT EXISTS bot_trades_coin_time ON bot_trades(coin_id,created_at DESC)`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS portfolio_history(id bigserial PRIMARY KEY,user_id uuid REFERENCES users(id),total numeric(24,8) NOT NULL,created_at timestamptz DEFAULT now());CREATE INDEX IF NOT EXISTS portfolio_history_user_time ON portfolio_history(user_id,created_at DESC);CREATE TABLE IF NOT EXISTS favorites(user_id uuid REFERENCES users(id),coin_id uuid REFERENCES coins(id),PRIMARY KEY(user_id,coin_id));CREATE TABLE IF NOT EXISTS price_alerts(id uuid PRIMARY KEY,user_id uuid REFERENCES users(id),coin_id uuid REFERENCES coins(id),target numeric(24,8) NOT NULL,direction text NOT NULL,triggered_at timestamptz,created_at timestamptz DEFAULT now())`);
  await pool.query("UPDATE coins SET is_active=false WHERE creator_id IS NULL AND ticker=ANY($1::text[])",[SYSTEM.map(s=>s[0])]);
  for(const [ticker,name,price,region] of STOCKS){const coinId=id(); const q=await pool.query(`INSERT INTO coins(id,ticker,name,description,logo,supply,pool_cash,pool_tokens,initial_price,asset_kind,region) VALUES($1,$2,$3,$4,$5,1000000,$6,100000,$7,'stock',$8) ON CONFLICT(ticker) DO UPDATE SET name=EXCLUDED.name,asset_kind='stock',region=EXCLUDED.region,is_active=true RETURNING id`,[coinId,ticker,name,'Игровая акция. Цена не связана с реальной биржей.',ticker[0],price*100000,price,region]);await pool.query('INSERT INTO price_history(coin_id,price) SELECT $1,$2 WHERE NOT EXISTS(SELECT 1 FROM price_history WHERE coin_id=$1)',[q.rows[0].id,price]);}
  for(const [name,kind,cash] of [['Новичок','novice',5000],['Скальпер','scalper',20000],['Инвестор','investor',30000],['Паникёр','panic',12000],['Криптокит','whale',250000],['Китайские скупщики','group',100000]]) await pool.query('INSERT INTO bot_accounts(id,name,kind,cash) VALUES($1,$2,$3,$4) ON CONFLICT(name) DO NOTHING',[id(),name,kind,cash]);
@@ -56,7 +61,7 @@ async function init(){
 }
 app.use(express.json({limit:'100kb'})); app.use(cookieParser()); app.use(auth); app.use(express.static(path.join(ROOT,'public')));
 app.get('/health',async(req,res)=>{try{await pool.query('SELECT 1');res.json({ok:true});}catch{res.status(503).json({ok:false});}});
-app.post('/api/register',async(req,res,next)=>{try{const nickname=String(req.body.nickname||'').trim(),email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');if(!/^[\p{L}\p{N}_-]{3,24}$/u.test(nickname)||!/^\S+@\S+\.\S+$/.test(email)||password.length<8)throw fail('Проверьте ник, email и пароль (от 8 символов)');const hash=await bcrypt.hash(password,12);const starting=num((await pool.query("SELECT value FROM settings WHERE key='starting_cash'")).rows[0].value);const q=await pool.query('INSERT INTO users(id,nickname,email,password_hash,cash) VALUES($1,$2,$3,$4,$5) RETURNING id,nickname,email,cash,role',[id(),nickname,email,hash,starting]);session(req,res,q.rows[0]);res.json(q.rows[0]);}catch(e){next(e.code==='23505'?fail('Ник или email уже занят'):e);}});
+app.post('/api/register',async(req,res,next)=>{try{const nickname=String(req.body.nickname||'').trim(),email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');if(!/^[\p{L}\p{N}_-]{3,24}$/u.test(nickname)||!/^\S+@\S+\.\S+$/.test(email)||password.length<8)throw fail('Проверьте ник, email и пароль (от 8 символов)');const hash=await bcrypt.hash(password,12);const starting=num((await pool.query("SELECT value FROM settings WHERE key='starting_cash'")).rows[0].value);const q=await pool.query('INSERT INTO users(id,nickname,email,password_hash,cash,initial_cash) VALUES($1,$2,$3,$4,$5,$5) RETURNING id,nickname,email,cash,role',[id(),nickname,email,hash,starting]);session(req,res,q.rows[0]);res.json(q.rows[0]);}catch(e){next(e.code==='23505'?fail('Ник или email уже занят'):e);}});
 app.post('/api/login',async(req,res,next)=>{try{const q=await pool.query('SELECT * FROM users WHERE email=$1',[String(req.body.email||'').toLowerCase().trim()]);const u=q.rows[0];if(!u||!(await bcrypt.compare(String(req.body.password||''),u.password_hash)))throw fail('Неверный email или пароль',401);if(u.banned)throw fail('Аккаунт заблокирован',403);session(req,res,u);res.json({id:u.id,nickname:u.nickname,email:u.email,cash:u.cash,role:u.role});}catch(e){next(e);}});
 app.post('/api/logout',(req,res)=>{res.clearCookie('cr_session');res.json({ok:true});});
 app.get('/api/me',(req,res)=>res.json(req.user||null));
@@ -71,7 +76,18 @@ app.get('/api/coin/:id',async(req,res,next)=>{try{
  if(!coin.rows[0])throw fail('Актив не найден',404);
  res.json({history:history.rows.reverse(),trades:trades.rows,day:day.rows[0],pool:{cash:coin.rows[0].pool_cash,tokens:coin.rows[0].pool_tokens}});
 }catch(e){next(e);}});
-app.get('/api/wallet',requireUser,async(req,res,next)=>{try{const [holdings,trades,transfers,tokens]=await Promise.all([pool.query('SELECT h.*,c.ticker,c.name,c.is_active,c.pool_cash/c.pool_tokens price FROM holdings h JOIN coins c ON c.id=h.coin_id WHERE h.user_id=$1 AND h.amount>0 ORDER BY h.amount*c.pool_cash/c.pool_tokens DESC',[req.user.id]),pool.query('SELECT t.*,c.ticker FROM trades t JOIN coins c ON c.id=t.coin_id WHERE t.user_id=$1 ORDER BY t.created_at DESC LIMIT 50',[req.user.id]),pool.query('SELECT t.*,c.ticker,s.nickname sender,r.nickname recipient FROM transfers t JOIN coins c ON c.id=t.coin_id JOIN users s ON s.id=t.sender_id JOIN users r ON r.id=t.recipient_id WHERE t.sender_id=$1 OR t.recipient_id=$1 ORDER BY t.created_at DESC LIMIT 30',[req.user.id]),pool.query('SELECT id,ticker,name FROM coins WHERE creator_id=$1',[req.user.id])]);const cash=num((await pool.query('SELECT cash FROM users WHERE id=$1',[req.user.id])).rows[0].cash);res.json({cash,holdings:holdings.rows,trades:trades.rows,transfers:transfers.rows,tokens:tokens.rows,total:round(cash+holdings.rows.reduce((s,h)=>s+num(h.amount)*num(h.price),0))});}catch(e){next(e);}});
+app.get('/api/wallet',requireUser,async(req,res,next)=>{try{const [holdings,trades,transfers,tokens]=await Promise.all([pool.query('SELECT h.*,c.ticker,c.name,c.asset_kind,c.is_active,c.pool_cash/c.pool_tokens price FROM holdings h JOIN coins c ON c.id=h.coin_id WHERE h.user_id=$1 AND h.amount>0 ORDER BY h.amount*c.pool_cash/c.pool_tokens DESC',[req.user.id]),pool.query('SELECT t.*,c.ticker FROM trades t JOIN coins c ON c.id=t.coin_id WHERE t.user_id=$1 ORDER BY t.created_at DESC LIMIT 50',[req.user.id]),pool.query('SELECT t.*,c.ticker,s.nickname sender,r.nickname recipient FROM transfers t JOIN coins c ON c.id=t.coin_id JOIN users s ON s.id=t.sender_id JOIN users r ON r.id=t.recipient_id WHERE t.sender_id=$1 OR t.recipient_id=$1 ORDER BY t.created_at DESC LIMIT 30',[req.user.id]),pool.query('SELECT id,ticker,name FROM coins WHERE creator_id=$1',[req.user.id])]);const user=(await pool.query('SELECT cash,initial_cash FROM users WHERE id=$1',[req.user.id])).rows[0];
+const total=q(holdings.rows.reduce((sum,h)=>sum.plus(D(h.amount).mul(h.price)),D(user.cash))).toFixed(8);
+await snapshotPortfolio(pool,req.user.id);
+const [history,dayBase,favorites,alerts]=await Promise.all([
+ pool.query('SELECT total,created_at FROM portfolio_history WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200',[req.user.id]),
+ pool.query("SELECT total FROM portfolio_history WHERE user_id=$1 AND created_at<=now()-interval '24 hours' ORDER BY created_at DESC LIMIT 1",[req.user.id]),
+ pool.query('SELECT coin_id FROM favorites WHERE user_id=$1',[req.user.id]),
+ pool.query('SELECT a.*,c.ticker FROM price_alerts a JOIN coins c ON c.id=a.coin_id WHERE a.user_id=$1 ORDER BY a.created_at DESC LIMIT 30',[req.user.id])
+]);
+res.json({cash:user.cash,holdings:holdings.rows,trades:trades.rows,transfers:transfers.rows,tokens:tokens.rows,total,profitAll:q(D(total).minus(user.initial_cash)).toFixed(8),profit24h:dayBase.rows[0]?q(D(total).minus(dayBase.rows[0].total)).toFixed(8):null,history:history.rows.reverse(),favorites:favorites.rows.map(f=>f.coin_id),alerts:alerts.rows});}catch(e){next(e);}});
+app.post('/api/favorites',requireUser,async(req,res,next)=>{try{const coinId=String(req.body.coinId||'');const coin=(await pool.query('SELECT id FROM coins WHERE id=$1 AND is_active=true',[coinId])).rows[0];if(!coin)throw fail('Актив не найден',404);const deleted=await pool.query('DELETE FROM favorites WHERE user_id=$1 AND coin_id=$2 RETURNING coin_id',[req.user.id,coinId]);if(!deleted.rowCount)await pool.query('INSERT INTO favorites(user_id,coin_id) VALUES($1,$2)',[req.user.id,coinId]);res.json({favorite:!deleted.rowCount});}catch(e){next(e);}});
+app.post('/api/alerts',requireUser,async(req,res,next)=>{try{const {coinId,direction}=req.body,target=req.body.target;if(!validAmount(target)||!['up','down'].includes(direction))throw fail('Некорректное уведомление');const coin=(await pool.query('SELECT pool_cash/pool_tokens price FROM coins WHERE id=$1 AND is_active=true',[coinId])).rows[0];if(!coin)throw fail('Актив не найден',404);if(direction==='up'&&D(target).lte(coin.price)||direction==='down'&&D(target).gte(coin.price))throw fail('Укажите цену выше или ниже текущей');await pool.query('INSERT INTO price_alerts(id,user_id,coin_id,target,direction) VALUES($1,$2,$3,$4,$5)',[id(),req.user.id,coinId,q(target).toFixed(8),direction]);res.json({ok:true});}catch(e){next(e);}});
 app.post('/api/quote',async(req,res,next)=>{try{
  const {side,coinId,mode=side==='buy'?'cash':'quantity'}=req.body,amount=req.body.amount;
  if(!['buy','sell'].includes(side)||!validAmount(amount))throw fail('Некорректная сумма');
@@ -96,7 +112,8 @@ app.post('/api/trade',requireUser,async(req,res,next)=>{try{
   if(side==='buy'){
    if(D(u.cash).lt(quote.cash))throw fail('Недостаточно игровых долларов');
    await c.query('UPDATE users SET cash=cash-$1 WHERE id=$2',[quote.cash,u.id]);
-   await c.query('INSERT INTO holdings(user_id,coin_id,amount) VALUES($1,$2,$3) ON CONFLICT(user_id,coin_id) DO UPDATE SET amount=holdings.amount+$3',[u.id,coinId,quote.quantity]);
+   const execution=q(D(quote.cash).div(quote.quantity)).toFixed(8);
+   await c.query('INSERT INTO holdings(user_id,coin_id,amount,cost_basis) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,coin_id) DO UPDATE SET cost_basis=CASE WHEN holdings.cost_basis IS NULL AND holdings.amount>0 THEN NULL ELSE (COALESCE(holdings.cost_basis,0)*holdings.amount+$3*$4)/(holdings.amount+$3) END,amount=holdings.amount+$3',[u.id,coinId,quote.quantity,execution]);
   }else{
    const holding=(await c.query('SELECT amount FROM holdings WHERE user_id=$1 AND coin_id=$2 FOR UPDATE',[u.id,coinId])).rows[0];
    if(!holding||D(holding.amount).lt(quote.quantity))throw fail('Недостаточно активов');
@@ -107,11 +124,44 @@ app.post('/api/trade',requireUser,async(req,res,next)=>{try{
   const price=q(D(quote.nextCash).div(quote.nextTokens)).toFixed(8);
   await c.query('INSERT INTO trades(id,user_id,coin_id,side,amount,cash,price,fee,request_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',[id(),u.id,coinId,side,quote.quantity,quote.cash,price,quote.fee,requestKey||null]);
   await c.query('INSERT INTO price_history(coin_id,price) VALUES($1,$2)',[coinId,price]);
+  await triggerAlerts(c,coinId,price);
   return {side,amount:quote.quantity,cash:quote.cash,price,fee:quote.fee};
  });res.json(result);
 }catch(e){next(e.status?e:fail(e.message));}});
-app.post('/api/tokens',requireUser,async(req,res,next)=>{try{const name=String(req.body.name||'').trim(),ticker=String(req.body.ticker||'').trim().toUpperCase(),description=String(req.body.description||'').trim(),logo=String(req.body.logo||'').trim(),supply=num(req.body.supply),liquidity=num(req.body.liquidity);if(name.length<3||name.length>40||!/^[A-Z0-9]{2,8}$/.test(ticker)||description.length>500||logo.length>4||!Number.isInteger(supply)||supply<100||supply>1e9||!Number.isFinite(liquidity)||liquidity<100||liquidity>1e8)throw fail('Проверьте параметры токена');const result=await tx(async c=>{const u=(await c.query('SELECT * FROM users WHERE id=$1 FOR UPDATE',[req.user.id])).rows[0];const fee=num((await c.query("SELECT value FROM settings WHERE key='listing_fee'")).rows[0].value);if(num(u.cash)<fee+liquidity)throw fail('Недостаточно средств для листинга и ликвидности');const coinId=id(),poolTokens=supply/2;await c.query('UPDATE users SET cash=cash-$1 WHERE id=$2',[fee+liquidity,u.id]);await c.query('INSERT INTO coins(id,ticker,name,description,logo,creator_id,supply,pool_cash,pool_tokens,initial_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[coinId,ticker,name,description,logo||ticker[0],u.id,supply,liquidity,poolTokens,liquidity/poolTokens]);await c.query('INSERT INTO holdings(user_id,coin_id,amount) VALUES($1,$2,$3)',[u.id,coinId,supply/2]);await c.query('INSERT INTO price_history(coin_id,price) VALUES($1,$2)',[coinId,liquidity/poolTokens]);await c.query('INSERT INTO news(id,body,kind,coin_id) VALUES($1,$2,$3,$4)',[id(),`Новый токен ${ticker} вышел на игровую биржу`,'listing',coinId]);return {id:coinId,ticker};});res.json(result);}catch(e){next(e.code==='23505'?fail('Этот тикер уже занят'):e);}});
-app.post('/api/transfer',requireUser,async(req,res,next)=>{try{const recipient=String(req.body.recipient||'').trim(),coinId=String(req.body.coinId||''),amount=num(req.body.amount);if(!Number.isFinite(amount)||amount<=0||amount>1e9)throw fail('Некорректное количество');const result=await tx(async c=>{const r=(await c.query('SELECT id FROM users WHERE nickname=$1 OR id::text=$1',[recipient])).rows[0];if(!r||r.id===req.user.id)throw fail('Получатель не найден');const h=(await c.query('SELECT amount FROM holdings WHERE user_id=$1 AND coin_id=$2 FOR UPDATE',[req.user.id,coinId])).rows[0];if(!h||num(h.amount)+1e-8<amount)throw fail('Недостаточно монет');const fee=round(amount*.005),received=round(amount-fee);await c.query('UPDATE holdings SET amount=amount-$1 WHERE user_id=$2 AND coin_id=$3',[amount,req.user.id,coinId]);await c.query('INSERT INTO holdings(user_id,coin_id,amount) VALUES($1,$2,$3) ON CONFLICT(user_id,coin_id) DO UPDATE SET amount=holdings.amount+$3',[r.id,coinId,received]);await c.query('INSERT INTO transfers(id,sender_id,recipient_id,coin_id,amount,fee) VALUES($1,$2,$3,$4,$5,$6)',[id(),req.user.id,r.id,coinId,amount,fee]);return {received,fee};});res.json(result);}catch(e){next(e);}});
+app.post('/api/tokens',requireUser,async(req,res,next)=>{try{
+ const name=String(req.body.name||'').trim(),ticker=String(req.body.ticker||'').trim().toUpperCase(),description=String(req.body.description||'').trim(),logo=String(req.body.logo||'').trim();
+ const supply=Number(req.body.supply),liquidity=req.body.liquidity;
+ if(name.length<3||name.length>40||!/^[A-Z0-9]{2,8}$/.test(ticker)||description.length>500||logo.length>4||!Number.isSafeInteger(supply)||supply<100||supply>1e9||!validAmount(liquidity,'100000000')||D(liquidity).lt(100))throw fail('Проверьте параметры токена');
+ const result=await tx(async c=>{
+  const u=(await c.query('SELECT * FROM users WHERE id=$1 FOR UPDATE',[req.user.id])).rows[0];
+  const fee=D((await c.query("SELECT value FROM settings WHERE key='listing_fee'")).rows[0].value);
+  const total=q(fee.plus(liquidity));if(D(u.cash).lt(total))throw fail('Недостаточно средств для листинга и ликвидности');
+  const coinId=id(),poolTokens=D(supply).div(2),initialPrice=q(D(liquidity).div(poolTokens)).toFixed(8);
+  if(!D(initialPrice).gt(0))throw fail('Начальная цена слишком мала');
+  await c.query('UPDATE users SET cash=cash-$1 WHERE id=$2',[total.toFixed(8),u.id]);
+  await c.query('INSERT INTO coins(id,ticker,name,description,logo,creator_id,supply,pool_cash,pool_tokens,initial_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[coinId,ticker,name,description,logo||ticker[0],u.id,supply,q(liquidity).toFixed(8),poolTokens.toFixed(8),initialPrice]);
+  await c.query('INSERT INTO holdings(user_id,coin_id,amount) VALUES($1,$2,$3)',[u.id,coinId,poolTokens.toFixed(8)]);
+  await c.query('INSERT INTO price_history(coin_id,price) VALUES($1,$2)',[coinId,initialPrice]);
+  await c.query('INSERT INTO news(id,body,kind,coin_id) VALUES($1,$2,$3,$4)',[id(),`Новый токен ${ticker} вышел на игровую биржу`,'listing',coinId]);
+  return {id:coinId,ticker};
+ });res.json(result);
+}catch(e){next(e.code==='23505'?fail('Этот тикер уже занят'):e);}});
+app.post('/api/transfer',requireUser,async(req,res,next)=>{try{
+ const recipient=String(req.body.recipient||'').trim(),coinId=String(req.body.coinId||''),amount=req.body.amount;
+ if(!validAmount(amount))throw fail('Некорректное количество');
+ const result=await tx(async c=>{
+  const r=(await c.query('SELECT id FROM users WHERE nickname=$1 OR id::text=$1',[recipient])).rows[0];
+  if(!r||r.id===req.user.id)throw fail('Получатель не найден');
+  const h=(await c.query('SELECT amount,cost_basis FROM holdings WHERE user_id=$1 AND coin_id=$2 FOR UPDATE',[req.user.id,coinId])).rows[0];
+  if(!h||D(h.amount).lt(amount))throw fail('Недостаточно активов');
+  const fee=q(D(amount).mul('0.005')).toFixed(8),received=q(D(amount).minus(fee)).toFixed(8);
+  if(!D(received).gt(0))throw fail('Сумма перевода слишком мала');
+  await c.query('UPDATE holdings SET amount=amount-$1 WHERE user_id=$2 AND coin_id=$3',[amount,req.user.id,coinId]);
+  await c.query('INSERT INTO holdings(user_id,coin_id,amount,cost_basis) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,coin_id) DO UPDATE SET cost_basis=CASE WHEN holdings.cost_basis IS NULL OR EXCLUDED.cost_basis IS NULL THEN NULL ELSE (holdings.cost_basis*holdings.amount+EXCLUDED.cost_basis*$3)/(holdings.amount+$3) END,amount=holdings.amount+$3',[r.id,coinId,received,h.cost_basis]);
+  await c.query('INSERT INTO transfers(id,sender_id,recipient_id,coin_id,amount,fee) VALUES($1,$2,$3,$4,$5,$6)',[id(),req.user.id,r.id,coinId,amount,fee]);
+  return {received,fee};
+ });res.json(result);
+}catch(e){next(e);}});
 app.get('/api/leaderboard',async(req,res,next)=>{try{const q=await pool.query(`SELECT u.id,u.nickname,u.cash,COALESCE(h.assets,0) assets,COALESCE(t.trades,0) trades,COALESCE(o.tokens,0) tokens FROM users u LEFT JOIN (SELECT h.user_id,sum(h.amount*c.pool_cash/c.pool_tokens) assets FROM holdings h JOIN coins c ON c.id=h.coin_id GROUP BY h.user_id) h ON h.user_id=u.id LEFT JOIN (SELECT user_id,count(*) trades FROM trades GROUP BY user_id) t ON t.user_id=u.id LEFT JOIN (SELECT creator_id,count(*) tokens FROM coins WHERE creator_id IS NOT NULL GROUP BY creator_id) o ON o.creator_id=u.id WHERE u.banned=false ORDER BY u.cash+COALESCE(h.assets,0) DESC LIMIT 50`);res.json(q.rows);}catch(e){next(e);}});
 app.get('/api/whales',async(req,res,next)=>{try{const q=await pool.query(`SELECT t.side,t.amount,t.cash,t.price,t.created_at,c.ticker,u.nickname FROM trades t JOIN coins c ON c.id=t.coin_id JOIN users u ON u.id=t.user_id WHERE t.cash>=100 ORDER BY t.created_at DESC LIMIT 50`);res.json(q.rows);}catch(e){next(e);}});
 app.get('/api/admin',requireAdmin,async(req,res,next)=>{try{const [users,settings,log]=await Promise.all([pool.query('SELECT id,nickname,email,cash,role,banned,created_at FROM users ORDER BY created_at DESC LIMIT 100'),pool.query('SELECT * FROM settings'),pool.query('SELECT * FROM admin_log ORDER BY created_at DESC LIMIT 50')]);res.json({users:users.rows,settings:Object.fromEntries(settings.rows.map(s=>[s.key,s.value])),log:log.rows});}catch(e){next(e);}});
@@ -140,6 +190,7 @@ async function botTick(){
    await c.query('UPDATE coins SET pool_cash=$1,pool_tokens=$2 WHERE id=$3',[quote.nextCash,quote.nextTokens,row.id]);
    const price=q(D(quote.nextCash).div(quote.nextTokens)).toFixed(8);
    await c.query('INSERT INTO price_history(coin_id,price) VALUES($1,$2)',[row.id,price]);
+   await triggerAlerts(c,row.id,price);
    await c.query('INSERT INTO bot_trades(id,bot_id,coin_id,side,amount,cash,price) VALUES($1,$2,$3,$4,$5,$6,$7)',[id(),b.id,row.id,buy?'buy':'sell',quote.quantity,quote.cash,price]);
    if(['whale','group'].includes(b.kind))await c.query('INSERT INTO news(id,body,kind,coin_id) VALUES($1,$2,$3,$4)',[id(),`${b.name} ${buy?'покупают':'продают'} ${row.ticker} на игровой бирже`,b.kind,row.id]);
   });
