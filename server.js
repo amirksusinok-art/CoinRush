@@ -189,9 +189,12 @@ async function botTick(){
  try{
   const settings=Object.fromEntries((await pool.query('SELECT * FROM settings')).rows.map(s=>[s.key,s.value]));
   if(settings.bot_enabled!=='true'||Math.random()>Math.min(1,num(settings.bot_frequency)))return;
-  const bot=(await pool.query('SELECT id,kind FROM bot_accounts ORDER BY random() LIMIT 1')).rows[0];
-  const event=bot?.kind!=='group'&&Math.random()<.025?COMPANY_EVENTS[Math.floor(Math.random()*COMPANY_EVENTS.length)]:null;
-  const coin=(await pool.query(event?'SELECT id FROM coins WHERE is_active=true AND ticker=$1':'SELECT id FROM coins WHERE is_active=true ORDER BY random() LIMIT 1',event?[event.ticker]:[])).rows[0];
+  const bot=(await pool.query('SELECT id,kind,cash FROM bot_accounts ORDER BY random() LIMIT 1')).rows[0];
+  if(!bot)return;
+  const held=(await pool.query('SELECT h.coin_id id FROM bot_holdings h JOIN coins c ON c.id=h.coin_id WHERE h.bot_id=$1 AND h.amount>=0.01 AND c.is_active=true ORDER BY random() LIMIT 1',[bot.id])).rows[0];
+  const plannedBuy=Number(bot.cash)<100?false:Math.random()<(settings.market_mode==='bull'?.68:settings.market_mode==='bear'?.32:.5);
+  const event=bot.kind!=='group'&&Number(bot.cash)>=100&&Math.random()<.025?COMPANY_EVENTS[Math.floor(Math.random()*COMPANY_EVENTS.length)]:null;
+  const coin=event?(await pool.query('SELECT id FROM coins WHERE is_active=true AND ticker=$1',[event.ticker])).rows[0]:!plannedBuy&&held?held:(await pool.query('SELECT id FROM coins WHERE is_active=true ORDER BY random() LIMIT 1')).rows[0];
   if(!bot||!coin)return;
   await tx(async c=>{
    const b=(await c.query('SELECT * FROM bot_accounts WHERE id=$1 FOR UPDATE',[bot.id])).rows[0];
@@ -199,14 +202,15 @@ async function botTick(){
    if(b.kind==='group'){
     campaign=(await c.query('SELECT * FROM group_campaigns WHERE bot_id=$1 FOR UPDATE',[b.id])).rows[0];
     if(!campaign||campaign.phase==='done'){
-     campaign=(await c.query("INSERT INTO group_campaigns(bot_id,coin_id,phase,steps) VALUES($1,$2,'buy',0) ON CONFLICT(bot_id) DO UPDATE SET coin_id=EXCLUDED.coin_id,phase='buy',steps=0,updated_at=now() RETURNING *",[b.id,coin.id])).rows[0];
+     const phase=Number(b.cash)<100&&held?'sell':'buy';
+     campaign=(await c.query("INSERT INTO group_campaigns(bot_id,coin_id,phase,steps) VALUES($1,$2,$3,0) ON CONFLICT(bot_id) DO UPDATE SET coin_id=EXCLUDED.coin_id,phase=EXCLUDED.phase,steps=0,updated_at=now() RETURNING *",[b.id,phase==='sell'?held.id:coin.id,phase])).rows[0];
     }
     targetId=campaign.coin_id;
    }
    const row=(await c.query('SELECT * FROM coins WHERE id=$1 FOR UPDATE',[targetId])).rows[0];
    if(!row?.is_active){if(campaign)await c.query("UPDATE group_campaigns SET phase='done',updated_at=now() WHERE bot_id=$1",[b.id]);return;}
    const holding=(await c.query('SELECT amount FROM bot_holdings WHERE bot_id=$1 AND coin_id=$2 FOR UPDATE',[b.id,row.id])).rows[0];
-   const buy=b.kind==='group'?campaign.phase==='buy':event?event.buy:Math.random()<(settings.market_mode==='bull'?.68:settings.market_mode==='bear'?.32:.5);
+   const buy=b.kind==='group'?campaign.phase==='buy':event?event.buy:plannedBuy;
    const fraction=b.kind==='whale'?.06:b.kind==='group'?(buy?.045:campaign.steps>=3?1:.28):.001+Math.random()*.008;
    const desired=buy?q(D(row.pool_cash).mul(fraction)):q(D(row.pool_tokens).mul(fraction));
    const amount=buy?DecimalMin(desired,b.cash):DecimalMin(desired,holding?.amount||0);

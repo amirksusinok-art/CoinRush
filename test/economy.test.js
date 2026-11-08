@@ -21,7 +21,7 @@ test('invalid monetary precision is rejected', () => {
  assert.equal(validAmount('-1'),false);
  assert.equal(validAmount('Infinity'),false);
 });
-test('OHLC carries prior close and preserves real high and low', () => {
+test('OHLC opens at first trade in its interval and preserves traded extremes', () => {
  const candles=buildCandles([{time:0,price:100},{time:10,price:110},{time:60,price:105},{time:70,price:120},{time:80,price:95}],60);
- assert.deepEqual(candles.map(({open,high,low,close})=>({open,high,low,close})),[{open:100,high:110,low:100,close:110},{open:110,high:120,low:95,close:95}]);
+ assert.deepEqual(candles.map(({open,high,low,close})=>({open,high,low,close})),[{open:100,high:110,low:100,close:110},{open:105,high:120,low:95,close:95}]);
 });
